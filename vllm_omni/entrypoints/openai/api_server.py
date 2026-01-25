@@ -96,8 +96,9 @@ def _remove_route_from_router(router_obj, path: str, methods: set[str] | None = 
         router_obj.routes.remove(route)
 
 
-# Remove vllm's /v1/chat/completions route so we can register our own omni version
+# Remove vllm's routes so we can register our own omni versions
 _remove_route_from_router(router, "/v1/chat/completions", {"POST"})
+_remove_route_from_router(router, "/v1/audio/speech", {"POST"})
 
 
 # Server entry points

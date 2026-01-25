@@ -91,3 +91,20 @@ class AudioMixin:
         except Exception as e:
             logger.error(f"An error occurred during speed adjustment: {e}")
             raise ValueError("Failed to apply speed adjustment.") from e
+
+    def create_streaming_audio_chunk(self, audio_chunk) -> bytes:
+        """Convert an AudioChunk to raw 16-bit PCM bytes for streaming."""
+        audio_data = audio_chunk.audio_data
+
+        if audio_data.size == 0:
+            return b""
+
+        if audio_data.ndim > 1:
+            audio_data = audio_data.flatten()
+
+        if not np.issubdtype(audio_data.dtype, np.floating):
+            audio_data = audio_data.astype(np.float32)
+
+        audio_data = np.clip(audio_data, -1.0, 1.0)
+        audio_int16 = (audio_data * 32767).astype(np.int16)
+        return audio_int16.tobytes()

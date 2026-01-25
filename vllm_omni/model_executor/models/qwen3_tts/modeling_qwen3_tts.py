@@ -15,6 +15,7 @@
 
 import json
 import os
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -1771,6 +1772,15 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         model_kwargs["generation_step"] = outputs.generation_step
         model_kwargs["trailing_text_hidden"] = outputs.trailing_text_hidden
         model_kwargs["tts_pad_embed"] = outputs.tts_pad_embed
+
+        if outputs.hidden_states is not None:
+            codec_ids = outputs.hidden_states[1]
+            if codec_ids is not None:
+                callbacks = getattr(self, "_streaming_callbacks", {})
+                callback = callbacks.get("__engine__") or callbacks.get(threading.current_thread().ident)
+                if callback is not None:
+                    callback.on_codec_generated(codec_ids)
+
         return model_kwargs
 
 
@@ -2082,13 +2092,15 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 else:
                     language_id = self.config.talker_config.codec_language_id[language.lower()]
 
+            spk_is_dialect = getattr(self.config.talker_config, "spk_is_dialect", None) or {}
             if (
                 language.lower() in ["chinese", "auto"]
                 and speaker != ""
                 and speaker is not None
-                and self.config.talker_config.spk_is_dialect[speaker.lower()] is not False
+                and speaker.lower() in spk_is_dialect
+                and spk_is_dialect[speaker.lower()] is not False
             ):
-                dialect = self.config.talker_config.spk_is_dialect[speaker.lower()]
+                dialect = spk_is_dialect[speaker.lower()]
                 language_id = self.config.talker_config.codec_language_id[dialect]
 
             tts_bos_embed, tts_eos_embed, tts_pad_embed = self.talker.text_projection(
@@ -2297,6 +2309,343 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         talker_hidden_states_list = [talker_hidden_states[i, :length, :] for i, length in enumerate(effective_lengths)]
 
         return talker_codes_list, talker_hidden_states_list
+
+    async def generate_streaming(
+        self,
+        input_ids: list[torch.Tensor] | None = None,
+        instruct_ids: list[torch.Tensor] | None = None,
+        ref_ids: list[torch.Tensor] | None = None,
+        voice_clone_prompt: list[dict] = None,
+        languages: list[str] = None,
+        speakers: list[str] = None,
+        non_streaming_mode=False,
+        max_new_tokens: int = 4096,
+        do_sample: bool = True,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        temperature: float = 0.9,
+        subtalker_dosample: bool = True,
+        subtalker_top_k: int = 50,
+        subtalker_top_p: float = 1.0,
+        subtalker_temperature: float = 0.9,
+        eos_token_id: int | None = None,
+        repetition_penalty: float = 1.05,
+        chunk_size: int = 24,
+        min_first_chunk: int = 12,
+        **kwargs,
+    ):
+        """Streaming variant of generate() that yields TTSCodecChunk objects."""
+        import asyncio
+        import concurrent.futures
+
+        from .tts_streamer import TTSCodecCallback
+
+        logger.info("generate_streaming called with %d inputs", len(input_ids))
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError as e:
+            logger.error("No running event loop: %s", e)
+            return
+
+        callback = TTSCodecCallback(chunk_size=chunk_size, min_first_chunk=min_first_chunk)
+        callback.set_event_loop(loop)
+        logger.info("Callback created and event loop set")
+
+        if not hasattr(self.talker, "_streaming_callbacks"):
+            self.talker._streaming_callbacks = {}
+
+        talker_kwargs = {
+            "max_new_tokens": max_new_tokens,
+            "min_new_tokens": 2,
+            "do_sample": do_sample,
+            "top_k": top_k,
+            "top_p": top_p,
+            "temperature": temperature,
+            "subtalker_dosample": subtalker_dosample,
+            "subtalker_top_k": subtalker_top_k,
+            "subtalker_top_p": subtalker_top_p,
+            "subtalker_temperature": subtalker_temperature,
+            "eos_token_id": eos_token_id if eos_token_id is not None else self.config.talker_config.codec_eos_token_id,
+            "repetition_penalty": repetition_penalty,
+            "suppress_tokens": [
+                i
+                for i in range(self.config.talker_config.vocab_size - 1024, self.config.talker_config.vocab_size)
+                if i not in (self.config.talker_config.codec_eos_token_id,)
+            ],
+            "output_hidden_states": True,
+            "return_dict_in_generate": True,
+        }
+
+        talker_input_embeds = [[] for _ in range(len(input_ids))]
+
+        voice_clone_spk_embeds = None
+        if voice_clone_prompt is not None:
+            voice_clone_spk_embeds = self.generate_speaker_prompt(voice_clone_prompt)
+
+        if instruct_ids is not None:
+            for index, instruct_id in enumerate(instruct_ids):
+                if instruct_id is not None:
+                    talker_input_embeds[index].append(
+                        self.talker.text_projection(self.talker.get_text_embeddings()(instruct_id))
+                    )
+
+        trailing_text_hiddens = []
+        if speakers is None:
+            speakers = [None] * len(input_ids)
+
+        for index, (input_id, language, speaker) in enumerate(zip(input_ids, languages, speakers)):
+            if voice_clone_spk_embeds is None:
+                if speaker == "" or speaker is None:
+                    speaker_embed = None
+                else:
+                    spk_id_dict = getattr(self.config.talker_config, "spk_id", None) or {}
+                    if speaker.lower() in spk_id_dict:
+                        spk_id = spk_id_dict[speaker.lower()]
+                        speaker_embed = self.talker.get_input_embeddings()(
+                            torch.tensor(
+                                spk_id,
+                                device=self.talker.device,
+                                dtype=input_id.dtype,
+                            )
+                        )
+                    else:
+                        speaker_embed = None
+            else:
+                if voice_clone_prompt["x_vector_only_mode"][index] or voice_clone_prompt["icl_mode"][index]:
+                    speaker_embed = voice_clone_spk_embeds[index]
+                else:
+                    speaker_embed = None
+
+            assert language is not None
+
+            if language.lower() == "auto":
+                language_id = None
+            else:
+                if language.lower() not in self.config.talker_config.codec_language_id:
+                    raise NotImplementedError(f"Language {language} not implemented")
+                else:
+                    language_id = self.config.talker_config.codec_language_id[language.lower()]
+
+            spk_is_dialect = getattr(self.config.talker_config, "spk_is_dialect", None) or {}
+            if (
+                language.lower() in ["chinese", "auto"]
+                and speaker != ""
+                and speaker is not None
+                and speaker.lower() in spk_is_dialect
+                and spk_is_dialect[speaker.lower()] is not False
+            ):
+                dialect = spk_is_dialect[speaker.lower()]
+                language_id = self.config.talker_config.codec_language_id[dialect]
+
+            tts_bos_embed, tts_eos_embed, tts_pad_embed = self.talker.text_projection(
+                self.talker.get_text_embeddings()(
+                    torch.tensor(
+                        [[self.config.tts_bos_token_id, self.config.tts_eos_token_id, self.config.tts_pad_token_id]],
+                        device=self.talker.device,
+                        dtype=input_id.dtype,
+                    )
+                )
+            ).chunk(3, dim=1)
+
+            if language_id is None:
+                codec_prefill_list = [
+                    [
+                        self.config.talker_config.codec_nothink_id,
+                        self.config.talker_config.codec_think_bos_id,
+                        self.config.talker_config.codec_think_eos_id,
+                    ]
+                ]
+            else:
+                codec_prefill_list = [
+                    [
+                        self.config.talker_config.codec_think_id,
+                        self.config.talker_config.codec_think_bos_id,
+                        language_id,
+                        self.config.talker_config.codec_think_eos_id,
+                    ]
+                ]
+
+            codec_input_emebdding_0 = self.talker.get_input_embeddings()(
+                torch.tensor(
+                    codec_prefill_list,
+                    device=self.talker.device,
+                    dtype=input_id.dtype,
+                )
+            )
+            codec_input_emebdding_1 = self.talker.get_input_embeddings()(
+                torch.tensor(
+                    [
+                        [
+                            self.config.talker_config.codec_pad_id,
+                            self.config.talker_config.codec_bos_id,
+                        ]
+                    ],
+                    device=self.talker.device,
+                    dtype=input_id.dtype,
+                )
+            )
+            if speaker_embed is None:
+                codec_input_emebdding = torch.cat([codec_input_emebdding_0, codec_input_emebdding_1], dim=1)
+            else:
+                codec_input_emebdding = torch.cat(
+                    [codec_input_emebdding_0, speaker_embed.view(1, 1, -1), codec_input_emebdding_1], dim=1
+                )
+
+            _talker_input_embed_role = self.talker.text_projection(self.talker.get_text_embeddings()(input_id[:, :3]))
+
+            _talker_input_embed = (
+                torch.cat(
+                    (
+                        tts_pad_embed.expand(-1, codec_input_emebdding.shape[1] - 2, -1),
+                        tts_bos_embed,
+                    ),
+                    dim=1,
+                )
+                + codec_input_emebdding[:, :-1]
+            )
+
+            talker_input_embed = torch.cat((_talker_input_embed_role, _talker_input_embed), dim=1)
+
+            if (
+                voice_clone_prompt is not None
+                and voice_clone_prompt["ref_code"] is not None
+                and voice_clone_prompt["icl_mode"][index]
+            ):
+                icl_input_embed, trailing_text_hidden = self.generate_icl_prompt(
+                    text_id=input_id[:, 3:-5],
+                    ref_id=ref_ids[index][:, 3:-2],
+                    ref_code=voice_clone_prompt["ref_code"][index].to(self.talker.device),
+                    tts_pad_embed=tts_pad_embed,
+                    tts_eos_embed=tts_eos_embed,
+                    non_streaming_mode=non_streaming_mode,
+                )
+                talker_input_embed = torch.cat([talker_input_embed, icl_input_embed], dim=1)
+            else:
+                talker_input_embed = torch.cat(
+                    [
+                        talker_input_embed,
+                        self.talker.text_projection(self.talker.get_text_embeddings()(input_id[:, 3:4]))
+                        + codec_input_emebdding[:, -1:],
+                    ],
+                    dim=1,
+                )
+                if non_streaming_mode:
+                    talker_input_embed = talker_input_embed[:, :-1]
+                    talker_input_embed = torch.cat(
+                        [
+                            talker_input_embed,
+                            torch.cat(
+                                (
+                                    self.talker.text_projection(self.talker.get_text_embeddings()(input_id[:, 3:-5])),
+                                    tts_eos_embed,
+                                ),
+                                dim=1,
+                            )
+                            + self.talker.get_input_embeddings()(
+                                torch.tensor(
+                                    [
+                                        [
+                                            self.config.talker_config.codec_pad_id,
+                                        ]
+                                        * (input_id[:, 3:-5].shape[1] + 1)
+                                    ],
+                                    device=self.talker.device,
+                                    dtype=input_id.dtype,
+                                )
+                            ),
+                            tts_pad_embed
+                            + self.talker.get_input_embeddings()(
+                                torch.tensor(
+                                    [
+                                        [
+                                            self.config.talker_config.codec_bos_id,
+                                        ]
+                                    ],
+                                    device=self.talker.device,
+                                    dtype=input_id.dtype,
+                                )
+                            ),
+                        ],
+                        dim=1,
+                    )
+                    trailing_text_hidden = tts_pad_embed
+                else:
+                    trailing_text_hidden = torch.cat(
+                        (
+                            self.talker.text_projection(self.talker.get_text_embeddings()(input_id[:, 4:-5])),
+                            tts_eos_embed,
+                        ),
+                        dim=1,
+                    )
+            talker_input_embeds[index].append(talker_input_embed)
+            trailing_text_hiddens.append(trailing_text_hidden)
+
+        for index, talker_input_embed in enumerate(talker_input_embeds):
+            talker_input_embeds[index] = torch.cat([item for item in talker_input_embed if item is not None], dim=1)
+
+        original_lengths = torch.tensor([t.shape[1] for t in talker_input_embeds])
+        sequences = [t.squeeze(0) for t in talker_input_embeds]
+        sequences_reversed = [t.flip(dims=[0]) for t in sequences]
+        padded_reversed = torch.nn.utils.rnn.pad_sequence(sequences_reversed, batch_first=True, padding_value=0.0)
+        talker_input_embeds = padded_reversed.flip(dims=[1])
+        batch_size, max_len = talker_input_embeds.shape[0], talker_input_embeds.shape[1]
+        indices = torch.arange(max_len).expand(batch_size, -1)
+        num_pads = max_len - original_lengths
+        talker_attention_mask = (indices >= num_pads.unsqueeze(1)).long().to(talker_input_embeds.device)
+
+        pad_embedding_vector = tts_pad_embed.squeeze()
+        sequences_to_pad = [t.squeeze(0) for t in trailing_text_hiddens]
+        trailing_text_original_lengths = [s.shape[0] for s in sequences_to_pad]
+        padded_hiddens = torch.nn.utils.rnn.pad_sequence(sequences_to_pad, batch_first=True, padding_value=0.0)
+        arange_tensor = torch.arange(max(trailing_text_original_lengths), device=padded_hiddens.device).expand(
+            len(trailing_text_original_lengths), -1
+        )
+        lengths_tensor = torch.tensor(trailing_text_original_lengths, device=padded_hiddens.device).unsqueeze(1)
+        padding_mask = arange_tensor >= lengths_tensor
+        padded_hiddens[padding_mask] = pad_embedding_vector
+        trailing_text_hiddens = padded_hiddens
+
+        logger.info("About to create executor and start generation thread")
+
+        def run_generation():
+            thread_id = threading.current_thread().ident
+            self.talker._streaming_callbacks[thread_id] = callback
+            logger.info("run_generation: registered callback for thread %s", thread_id)
+
+            try:
+                logger.info("run_generation: starting talker.generate")
+                result = self.talker.generate(
+                    inputs_embeds=talker_input_embeds,
+                    attention_mask=talker_attention_mask,
+                    trailing_text_hidden=trailing_text_hiddens,
+                    tts_pad_embed=tts_pad_embed,
+                    **talker_kwargs,
+                )
+                logger.info("run_generation: talker.generate completed, calling finalize")
+                callback.finalize()
+                return result
+            except Exception as e:
+                logger.error("run_generation: exception occurred: %s", e)
+                callback.signal_error(e)
+                raise
+            finally:
+                self.talker._streaming_callbacks.pop(thread_id, None)
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        gen_future = loop.run_in_executor(executor, run_generation)
+        logger.info("Executor task scheduled, starting async iteration")
+
+        try:
+            async for chunk in callback:
+                logger.info("Received chunk %d", chunk.chunk_index)
+                yield chunk
+        finally:
+            try:
+                await gen_future
+            except Exception as e:
+                logger.error("generate_streaming: gen_future exception: %s", e)
+            executor.shutdown(wait=False)
 
 
 __all__ = [

@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import gc
 import logging
+import queue
+import threading
+from collections.abc import Callable
 from copy import copy
 
 import numpy as np
@@ -35,11 +38,165 @@ from vllm.v1.worker.gpu_model_runner import (
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 
+from vllm_omni.engine import OmniEngineCoreOutput, StreamingAudioChunk, StreamingCodecChunk
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker.gpu_ar_model_runner import ExecuteModelState
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+from vllm_omni.worker.streaming_output_emitter import StreamingOutputEmitter
 
 logger = logging.getLogger(__name__)
+
+
+class GenerationCancelled(Exception):
+    pass
+
+
+class StreamingTTSCallback:
+    """Callback for streaming TTS codec generation."""
+
+    _shared_emitter = None
+    _emitter_lock = threading.Lock()
+
+    @classmethod
+    def _get_emitter(cls):
+        if cls._shared_emitter is None:
+            with cls._emitter_lock:
+                if cls._shared_emitter is None:
+                    try:
+                        from vllm_omni.streaming import StreamingChunkEmitter
+                        cls._shared_emitter = StreamingChunkEmitter()
+                        cls._shared_emitter.connect()
+                        logger.info("StreamingTTSCallback: ZMQ emitter initialized")
+                    except Exception as e:
+                        logger.warning("Failed to init ZMQ emitter: %s", e)
+        return cls._shared_emitter
+
+    def __init__(
+        self,
+        request_id: str,
+        output_queue: queue.Queue,
+        chunk_threshold: int = 24,
+        streaming_decoder=None,
+    ):
+        self.request_id = request_id
+        self.output_queue = output_queue
+        self.chunk_threshold = chunk_threshold
+        self.streaming_decoder = streaming_decoder
+        self._accumulated_codec_ids: list[torch.Tensor] = []
+        self._chunk_index: int = 0
+        self._accumulated_frames: int = 0
+        self._lock = threading.Lock()
+        self._sample_rate = 24000
+        self._cancelled = False
+
+        if streaming_decoder is not None:
+            try:
+                self._sample_rate = streaming_decoder.get_sample_rate()
+            except Exception:
+                pass
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def on_codec_generated(self, codec_ids: torch.Tensor) -> None:
+        if self._cancelled:
+            raise GenerationCancelled(f"Request {self.request_id} was cancelled")
+
+        emitter = self._get_emitter()
+        if emitter is not None and emitter.is_cancelled(self.request_id):
+            self._cancelled = True
+            raise GenerationCancelled(f"Request {self.request_id} was cancelled")
+
+        with self._lock:
+            if codec_ids is None:
+                return
+
+            codec_chunk = codec_ids.detach().cpu()
+            self._accumulated_codec_ids.append(codec_chunk)
+            self._accumulated_frames += 1
+
+            if self._accumulated_frames >= self.chunk_threshold:
+                self._emit_chunk(is_final=False)
+
+    def _emit_chunk(self, is_final: bool = False) -> None:
+        if not self._accumulated_codec_ids:
+            if is_final:
+                audio_chunk = StreamingAudioChunk(
+                    audio_bytes=b"",
+                    sample_rate=self._sample_rate,
+                    chunk_index=self._chunk_index,
+                    is_final=True,
+                )
+                self._send_audio_chunk(audio_chunk)
+            return
+
+        combined = torch.stack([c.squeeze(0) for c in self._accumulated_codec_ids], dim=0)
+        audio_chunk = self._decode_to_audio(combined, is_final)
+        self._send_audio_chunk(audio_chunk)
+
+        self._accumulated_codec_ids = []
+        self._accumulated_frames = 0
+        self._chunk_index += 1
+
+    def _decode_to_audio(self, codec_ids: torch.Tensor, is_final: bool) -> StreamingAudioChunk:
+        if self.streaming_decoder is None:
+            return StreamingAudioChunk(
+                audio_bytes=b"",
+                sample_rate=self._sample_rate,
+                chunk_index=self._chunk_index,
+                is_final=is_final,
+            )
+
+        try:
+            from vllm_omni.model_executor.models.qwen3_tts.tts_streamer import TTSCodecChunk
+
+            tts_chunk = TTSCodecChunk(
+                codec_ids=codec_ids,
+                chunk_index=self._chunk_index,
+                is_final=is_final,
+            )
+
+            audio_result = self.streaming_decoder.decode_chunk(tts_chunk)
+
+            audio_data = audio_result.audio_data
+            if audio_data.size > 0:
+                audio_data = np.clip(audio_data, -1.0, 1.0)
+                audio_int16 = (audio_data * 32767).astype(np.int16)
+                audio_bytes = audio_int16.tobytes()
+            else:
+                audio_bytes = b""
+
+            return StreamingAudioChunk(
+                audio_bytes=audio_bytes,
+                sample_rate=audio_result.sample_rate,
+                chunk_index=self._chunk_index,
+                is_final=is_final,
+            )
+
+        except Exception as e:
+            logger.error("Failed to decode codec chunk: %s", e, exc_info=True)
+            return StreamingAudioChunk(
+                audio_bytes=b"",
+                sample_rate=self._sample_rate,
+                chunk_index=self._chunk_index,
+                is_final=is_final,
+            )
+
+    def _send_audio_chunk(self, audio_chunk: StreamingAudioChunk) -> None:
+        emitter = self._get_emitter()
+        if emitter is not None:
+            if emitter.emit(self.request_id, audio_chunk):
+                return
+
+        self.output_queue.put((self.request_id, audio_chunk))
+
+    def finalize(self) -> None:
+        with self._lock:
+            self._emit_chunk(is_final=True)
+
+            emitter = self._get_emitter()
+            if emitter is not None:
+                emitter.clear_cancelled(self.request_id)
 
 
 class GPUGenerationModelRunner(OmniGPUModelRunner):
@@ -49,6 +206,121 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
     - Does not compute logits or perform token sampling.
     - Executes generation process and returns tensors via `pooler_output`.
     """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._streaming_callbacks: dict[str, StreamingTTSCallback] = {}
+        self._streaming_output_queue: queue.Queue = queue.Queue()
+        self._streaming_emitter: StreamingOutputEmitter | None = None
+        self._streaming_output_callback: Callable[[str, OmniEngineCoreOutput], None] | None = None
+        self._streaming_decoder = None
+        self._streaming_decoder_initialized = False
+
+    def _get_or_create_streaming_decoder(self):
+        if self._streaming_decoder_initialized:
+            return self._streaming_decoder
+
+        self._streaming_decoder_initialized = True
+
+        try:
+            from vllm_omni.model_executor.models.qwen3_tts.streaming_decoder import (
+                StreamingAudioDecoderWrapper,
+            )
+
+            speech_tokenizer = self._get_speech_tokenizer()
+            if speech_tokenizer is not None:
+                self._streaming_decoder = StreamingAudioDecoderWrapper(
+                    speech_tokenizer=speech_tokenizer,
+                    left_context_frames=25,
+                )
+                logger.info("Streaming decoder initialized")
+        except Exception as e:
+            logger.error("Failed to initialize streaming decoder: %s", e)
+
+        return self._streaming_decoder
+
+    def _get_speech_tokenizer(self):
+        try:
+            if hasattr(self.model, "model"):
+                qwen3_tts_model = self.model.model
+                if hasattr(qwen3_tts_model, "model"):
+                    qwen3_tts_for_gen = qwen3_tts_model.model
+                    if hasattr(qwen3_tts_for_gen, "speech_tokenizer"):
+                        return qwen3_tts_for_gen.speech_tokenizer
+        except Exception:
+            pass
+        return None
+
+    def setup_streaming_callback(
+        self,
+        request_id: str,
+        chunk_threshold: int = 24,
+    ) -> StreamingTTSCallback:
+        streaming_decoder = self._get_or_create_streaming_decoder()
+
+        if streaming_decoder is not None:
+            streaming_decoder.reset()
+
+        callback = StreamingTTSCallback(
+            request_id=request_id,
+            output_queue=self._streaming_output_queue,
+            chunk_threshold=chunk_threshold,
+            streaming_decoder=streaming_decoder,
+        )
+        self._streaming_callbacks[request_id] = callback
+        return callback
+
+    def get_streaming_callback(self, request_id: str) -> StreamingTTSCallback | None:
+        return self._streaming_callbacks.get(request_id)
+
+    def remove_streaming_callback(self, request_id: str) -> None:
+        self._streaming_callbacks.pop(request_id, None)
+
+    def cancel_streaming_request(self, request_id: str) -> bool:
+        callback = self._streaming_callbacks.get(request_id)
+        if callback is not None:
+            callback.cancel()
+            return True
+        return False
+
+    def get_streaming_chunks(self) -> list[tuple[str, StreamingCodecChunk]]:
+        chunks = []
+        while True:
+            try:
+                chunk = self._streaming_output_queue.get_nowait()
+                chunks.append(chunk)
+            except queue.Empty:
+                break
+        return chunks
+
+    def set_streaming_output_callback(
+        self,
+        callback: Callable[[str, OmniEngineCoreOutput], None],
+    ) -> None:
+        self._streaming_output_callback = callback
+        if self._streaming_emitter is None:
+            self._streaming_emitter = StreamingOutputEmitter(
+                streaming_queue=self._streaming_output_queue,
+                output_callback=callback,
+            )
+            self._streaming_emitter.start()
+
+    def stop_streaming_emitter(self) -> None:
+        if self._streaming_emitter is not None:
+            self._streaming_emitter.stop()
+            self._streaming_emitter = None
+
+    def _update_states(self, scheduler_output: SchedulerOutput) -> None:
+        for req_id in scheduler_output.finished_req_ids:
+            if req_id in self._streaming_callbacks:
+                callback = self._streaming_callbacks[req_id]
+                try:
+                    callback.finalize()
+                except Exception:
+                    pass
+                self.remove_streaming_callback(req_id)
+
+        super()._update_states(scheduler_output)
 
     @torch.inference_mode()
     def execute_model(
@@ -235,6 +507,22 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                 logits_indices=logits_indices,
             )
 
+        if outputs is None:
+            self.execute_model_state = ExecuteModelState(
+                scheduler_output,
+                None,
+                spec_decode_metadata,
+                spec_decode_common_attn_metadata,
+                None,
+                None,
+                None,
+                ec_connector_output,
+                cudagraph_stats,
+                {},
+            )
+            self.kv_connector_output = kv_connector_output
+            return None
+
         _, multimodal_outputs = self.extract_multimodal_outputs(outputs)
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
@@ -291,6 +579,8 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
         ) = self.execute_model_state
         self.execute_model_state = None
 
+        self._finalize_streaming_callbacks()
+
         pooler_output: list[object] = []
         if isinstance(multimodal_outputs, torch.Tensor):
             assert multimodal_outputs.shape[0] == 1, (
@@ -315,6 +605,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             pooler_output.append(mm_payload)
         else:
             raise RuntimeError("Unsupported diffusion output type")
+
         output = OmniModelRunnerOutput(
             req_ids=self.input_batch.req_ids,
             req_id_to_index=self.input_batch.req_id_to_index,
@@ -340,6 +631,19 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             logprobs_tensors=None,
         )
 
+    def _finalize_streaming_callbacks(self) -> list[tuple[str, StreamingCodecChunk]]:
+        callbacks_to_finalize = list(self._streaming_callbacks.keys())
+        for req_id in callbacks_to_finalize:
+            callback = self._streaming_callbacks.get(req_id)
+            if callback is not None:
+                callback.finalize()
+                self.remove_streaming_callback(req_id)
+
+        if self._streaming_emitter is not None and self._streaming_emitter.is_running():
+            return []
+
+        return self.get_streaming_chunks()
+
     def _run_generation_model(
         self,
         *,
@@ -359,7 +663,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
         Returns:
             Audio waveforms: [batch, 1, waveform_len] or list of tensors
         """
-        # Keep inputs identical to AR runner
+        streaming_callback = self._get_streaming_callback_for_batch()
+        self._register_engine_streaming_callback(streaming_callback)
+
         kwargs = dict(
             input_ids=input_ids,
             positions=positions,
@@ -371,13 +677,71 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             sampler=self.sampler,
         )
 
-        if hasattr(self.model, "forward"):
-            return self._model_forward(**kwargs)
+        try:
+            if hasattr(self.model, "forward"):
+                return self._model_forward(**kwargs)
 
-        raise RuntimeError(
-            "The loaded model does not expose diffusion interfaces 'sample', "
-            "'forward', or 'diffuse'. Please implement one of them or adapt the runner."
-        )
+            raise RuntimeError(
+                "The loaded model does not expose diffusion interfaces 'sample', "
+                "'forward', or 'diffuse'. Please implement one of them or adapt the runner."
+            )
+        except GenerationCancelled:
+            return None
+        finally:
+            self._unregister_engine_streaming_callback()
+
+    def _register_engine_streaming_callback(self, callback: StreamingTTSCallback | None) -> None:
+        if callback is None:
+            return
+
+        talker = self._get_talker_model()
+        if talker is not None:
+            if not hasattr(talker, "_streaming_callbacks"):
+                talker._streaming_callbacks = {}
+            talker._streaming_callbacks["__engine__"] = callback
+
+    def _unregister_engine_streaming_callback(self) -> None:
+        talker = self._get_talker_model()
+        if talker is not None and hasattr(talker, "_streaming_callbacks"):
+            talker._streaming_callbacks.pop("__engine__", None)
+
+    def _get_talker_model(self):
+        try:
+            if hasattr(self.model, "model"):
+                qwen3_tts_model = self.model.model
+                if hasattr(qwen3_tts_model, "model"):
+                    qwen3_tts_for_gen = qwen3_tts_model.model
+                    if hasattr(qwen3_tts_for_gen, "talker"):
+                        return qwen3_tts_for_gen.talker
+        except Exception:
+            pass
+        return None
+
+    def _get_streaming_callback_for_batch(self) -> StreamingTTSCallback | None:
+        for req_id in self.input_batch.req_ids:
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                continue
+
+            additional_info = getattr(req_state, "additional_information_cpu", None)
+
+            if additional_info is not None and isinstance(additional_info, dict):
+                streaming_tts = additional_info.get("streaming_tts")
+                if streaming_tts is not None:
+                    if isinstance(streaming_tts, list):
+                        streaming_tts = streaming_tts[0] if streaming_tts else False
+                    if streaming_tts:
+                        global_req_id = additional_info.get("global_request_id")
+                        if isinstance(global_req_id, list):
+                            global_req_id = global_req_id[0] if global_req_id else None
+                        emit_req_id = global_req_id or req_id
+
+                        callback = self._streaming_callbacks.get(emit_req_id)
+                        if callback is None:
+                            callback = self.setup_streaming_callback(emit_req_id)
+                        return callback
+
+        return None
 
     @torch.inference_mode()
     def _dummy_sampler_run(self, hidden_states: torch.Tensor) -> None:

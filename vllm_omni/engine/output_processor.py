@@ -13,6 +13,7 @@ from vllm.v1.engine.output_processor import OutputProcessorOutput, RequestOutput
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import IterationStats
 
+from vllm_omni.engine import OmniEngineCoreOutput, StreamingCodecChunk
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -24,6 +25,9 @@ class OmniRequestState(RequestState):
     Extends the base RequestState with support for accumulating
     multimodal tensor outputs (e.g., images, audio, latents) that
     are produced incrementally during generation.
+
+    Also supports TTS streaming by tracking streaming codec chunks
+    and emitting intermediate outputs.
     """
 
     def __init__(
@@ -34,6 +38,51 @@ class OmniRequestState(RequestState):
         super().__init__(*args, **kwargs)
         self.mm_type: str | None = None
         self.mm_accumulated: Dict[str, Any] | None = None
+        # Streaming TTS support
+        self.streaming_tts_enabled: bool = False
+        self.streaming_codec_chunks: list[StreamingCodecChunk] = []
+
+    def add_streaming_codec_chunk(self, chunk: StreamingCodecChunk) -> None:
+        """Add a streaming codec chunk for TTS streaming."""
+        self.streaming_codec_chunks.append(chunk)
+
+    def make_streaming_output(
+        self,
+        codec_chunk: StreamingCodecChunk,
+    ) -> OmniRequestOutput | None:
+        """Create an intermediate streaming output for TTS."""
+        from vllm.outputs import CompletionOutput, RequestOutput
+
+        completion_output = CompletionOutput(
+            index=0,
+            text="",
+            token_ids=[],
+            cumulative_logprob=None,
+            logprobs=None,
+            finish_reason=None,
+            stop_reason=None,
+        )
+
+        # Attach streaming codec chunk to the output
+        if not hasattr(completion_output, "multimodal_output"):
+            setattr(completion_output, "multimodal_output", {})
+        completion_output.multimodal_output["streaming_codec_chunk"] = codec_chunk
+
+        request_output = RequestOutput(
+            request_id=self.request_id,
+            prompt=None,
+            prompt_token_ids=[],
+            prompt_logprobs=None,
+            outputs=[completion_output],
+            finished=codec_chunk.is_final,
+        )
+
+        return OmniRequestOutput(
+            stage_id=0,  # Will be set by stage worker
+            final_output_type="audio",
+            request_output=request_output,
+            finished=codec_chunk.is_final,
+        )
 
     def add_multimodal_tensor(self, payload: Any | None, mm_type: str | None) -> None:
         if payload is None:
@@ -324,6 +373,14 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             and list of request IDs to abort
         """
         self._reqid_to_mm_type.clear()
+
+        # First pass: handle codec chunks for streaming TTS
+        streaming_outputs: list[Any] = []
+        for eco in engine_core_outputs:
+            streaming_output = self._process_streaming_codec_chunk(eco)
+            if streaming_output is not None:
+                streaming_outputs.append(streaming_output)
+
         for eco in engine_core_outputs:
             mm_type = (self.engine_core_output_type or "").lower()
             if mm_type:
@@ -420,10 +477,68 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                     req_state.mm_accumulated = None
                     req_state.mm_type = None
 
+        # Include streaming outputs with regular outputs
+        # Streaming outputs are prepended so they're processed first
+        all_outputs = streaming_outputs + request_outputs
+
         return OutputProcessorOutput(
-            request_outputs=request_outputs,
+            request_outputs=all_outputs,
             reqs_to_abort=reqs_to_abort,
         )
+
+    def _process_streaming_codec_chunk(
+        self, eco: EngineCoreOutput
+    ) -> OmniRequestOutput | None:
+        """Process streaming codec chunk for TRUE streaming TTS."""
+        streaming_chunk = getattr(eco, "streaming_codec_chunk", None)
+        if streaming_chunk is None:
+            return None
+
+        req_id = eco.request_id
+        req_state = self.request_states.get(req_id)
+
+        if req_state is None:
+            logger.debug(
+                "Received streaming chunk for unknown request %s, creating output anyway",
+                req_id,
+            )
+            # Create a minimal output even without request state
+            from vllm.outputs import CompletionOutput, RequestOutput
+
+            completion_output = CompletionOutput(
+                index=0,
+                text="",
+                token_ids=[],
+                cumulative_logprob=None,
+                logprobs=None,
+                finish_reason=None,
+                stop_reason=None,
+            )
+            setattr(completion_output, "multimodal_output", {
+                "streaming_codec_chunk": streaming_chunk
+            })
+
+            request_output = RequestOutput(
+                request_id=req_id,
+                prompt=None,
+                prompt_token_ids=[],
+                prompt_logprobs=None,
+                outputs=[completion_output],
+                finished=streaming_chunk.is_final,
+            )
+
+            return OmniRequestOutput(
+                stage_id=0,
+                final_output_type="audio",
+                request_output=request_output,
+                finished=streaming_chunk.is_final,
+            )
+
+        # Use request state's make_streaming_output if available
+        if isinstance(req_state, OmniRequestState):
+            return req_state.make_streaming_output(streaming_chunk)
+
+        return None
 
     # ---- routing helpers ----
     def _route_and_normalize(self, eco: EngineCoreOutput) -> None:

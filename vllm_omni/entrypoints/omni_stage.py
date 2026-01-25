@@ -1259,6 +1259,8 @@ async def _stage_worker_async(
     else:
         log_stats_task = None
 
+    # Streaming TTS uses a separate ZMQ channel (see vllm_omni/streaming/) that bypasses vLLM's msgspec IPC
+
     # Don't keep the dummy data in memory (only for LLM engines)
     if stage_type != "diffusion":
         await stage_engine.reset_mm_cache()

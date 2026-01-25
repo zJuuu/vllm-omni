@@ -73,8 +73,48 @@ class OmniEngineCoreRequest(EngineCoreRequest):
     additional_information: AdditionalInformationPayload | None = None
 
 
+class StreamingCodecChunk(msgspec.Struct):
+    """Streaming codec chunk for TTS streaming."""
+
+    codec_ids: list[int]  # Stored as list for msgspec serialization
+    codec_shape: list[int]  # Original tensor shape
+    chunk_index: int
+    is_final: bool = False
+
+    @classmethod
+    def from_tensor(
+        cls,
+        codec_tensor: torch.Tensor,
+        chunk_index: int,
+        is_final: bool = False,
+    ) -> "StreamingCodecChunk":
+        """Create a StreamingCodecChunk from a tensor."""
+        return cls(
+            codec_ids=codec_tensor.flatten().tolist(),
+            codec_shape=list(codec_tensor.shape),
+            chunk_index=chunk_index,
+            is_final=is_final,
+        )
+
+    def to_tensor(self, device: str = "cpu") -> torch.Tensor:
+        """Convert the codec_ids back to a tensor."""
+        tensor = torch.tensor(self.codec_ids, dtype=torch.long, device=device)
+        return tensor.reshape(self.codec_shape) if self.codec_shape else tensor
+
+
+class StreamingAudioChunk(msgspec.Struct):
+    """Streaming audio chunk with pre-decoded PCM bytes for TTS streaming."""
+
+    audio_bytes: bytes  # Raw PCM audio bytes
+    sample_rate: int
+    chunk_index: int
+    is_final: bool = False
+
+
 class OmniEngineCoreOutput(EngineCoreOutput):
     pooling_output: dict[str, torch.Tensor] | None = None
+    # Streaming TTS support: intermediate codec chunks
+    streaming_codec_chunk: StreamingCodecChunk | None = None
 
 
 class OmniEngineCoreOutputs(EngineCoreOutputs):
