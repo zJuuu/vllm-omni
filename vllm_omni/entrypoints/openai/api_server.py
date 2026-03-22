@@ -1229,7 +1229,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         )
         _update_if_not_none(gen_params, "generator_device", request.generator_device)
 
-        request_id = f"chatcmpl-{random_uuid()}"
+        request_id = f"img_gen-{random_uuid()}"
 
         logger.info(f"Generating {request.n} image(s) {size_str}")
 
